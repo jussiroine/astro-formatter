@@ -185,11 +185,34 @@ function sanitizeSlug(slug, title) {
   return base || "post";
 }
 
+function normalizeImageUrls(text, ghostUrl = "") {
+  if (!text) {
+    return text;
+  }
+
+  let value = String(text);
+  const ghostBase = (ghostUrl || "").replace(/\/$/, "");
+
+  if (ghostBase) {
+    const escapedGhostBase = ghostBase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const ghostUploadsRe = new RegExp(`${escapedGhostBase}/wp-content/uploads/(\\d{4})/(\\d{2})/([^\\s)\"']+)`, "gi");
+    value = value.replace(ghostUploadsRe, "/img/$1/$2/$3");
+  }
+
+  value = value.replace(/https?:\/\/[^\s)"']+\/wp-content\/uploads\/(\d{4})\/(\d{2})\/([^\s)"']+)/gi, "/img/$1/$2/$3");
+  value = value.replace(/https?:\/\/[^\s)"']+\/content\/images\/wordpress\/(\d{4})\/(\d{2})\/([^\s)"']+)/gi, "/img/$1/$2/$3");
+  value = value.replace(/https?:\/\/[^\s)"']+\/content\/images\/(\d{4})\/(\d{2})\/([^\s)"']+)/gi, "/img/$1/$2/$3");
+  value = value.replace(/__GHOST_URL__\/content\/images\/(\d{4})\/(\d{2})\/([^\s)"']+)/g, "/img/$1/$2/$3");
+  value = value.replace(/__GHOST_URL__\/content\/images/g, "/img");
+
+  return value;
+}
+
 function buildFrontMatter(post, defaults, tags = [], category = defaults.category) {
   const date = toIsoDate(post.published_at) || toIsoDate(post.created_at) || "1970-01-01";
   const description = post.custom_excerpt || firstSentence(post.plaintext) || post.title || "";
   let image = post.feature_image || "";
-  image = image.replace(/__GHOST_URL__\/content\/images/g, "/img");
+  image = normalizeImageUrls(image, defaults.ghostUrl);
   const alt = post.title || "";
   const readTime = estimateReadTime(post.plaintext || "");
 
@@ -211,7 +234,6 @@ function buildFrontMatter(post, defaults, tags = [], category = defaults.categor
     `tags: [${tags.map((t) => yamlEscape(t)).join(", ")}]`,
     `slug: ${yamlEscape(post.slug || "")}`,
     `status: ${yamlEscape(post.status || "")}`,
-    `views: 1`,
     "---",
   ].join("\n");
 }
@@ -236,7 +258,7 @@ function buildContent(post, ghostUrl) {
   if (ghostUrl) {
     markdown = markdown.replace(/__GHOST_URL__/g, ghostUrl.replace(/\/$/, ""));
   }
-  return markdown;
+  return normalizeImageUrls(markdown, ghostUrl);
 }
 
 function matchesStatus(post, status) {
@@ -246,8 +268,45 @@ function matchesStatus(post, status) {
   return (post.status || "").toLowerCase() === status.toLowerCase();
 }
 
+function processTerminalOutput(str) {
+  // Interpret VT100 escape sequences rather than just stripping them.
+  // ESC[nD (cursor back n) removes the last n characters from the buffer so
+  // partial words written before a correction are not left behind.
+  // ESC[K (erase to end of line) is a no-op here since cursor-back already
+  // trimmed the buffer.  All other escape sequences are discarded.
+  // Carriage returns (\r) rewind to the start of the current line.
+  let result = "";
+  let i = 0;
+  while (i < str.length) {
+    if (str[i] === "\x1B" && str[i + 1] === "[") {
+      let j = i + 2;
+      while (j < str.length && !/[@-~]/.test(str[j])) {
+        j += 1;
+      }
+      const params = str.slice(i + 2, j);
+      const cmd = str[j];
+      i = j + 1;
+      if (cmd === "D") {
+        // Cursor back n — trim that many characters from the buffer
+        const n = parseInt(params, 10) || 1;
+        result = result.slice(0, -n);
+      }
+      // ESC[K and all other sequences are intentionally ignored
+    } else if (str[i] === "\r") {
+      // Carriage return — rewind to start of the current line
+      const lastNewline = result.lastIndexOf("\n");
+      result = result.slice(0, lastNewline + 1);
+      i += 1;
+    } else {
+      result += str[i];
+      i += 1;
+    }
+  }
+  return result;
+}
+
 function runOllamaPrompt(model, prompt) {
-  return execFileSync(
+  const raw = execFileSync(
     "ollama",
     ["run", "--hidethinking", "--think=false", model, prompt],
     {
@@ -256,6 +315,7 @@ function runOllamaPrompt(model, prompt) {
       windowsHide: true,
     }
   );
+  return processTerminalOutput(raw);
 }
 
 const CATEGORY_CHOICES = [
@@ -278,11 +338,42 @@ const CATEGORY_CHOICES = [
   "General",
 ];
 
+const TAG_CHOICES = [
+  "Azure",
+  "Microsoft 365",
+  "SharePoint",
+  "Power Platform",
+  "PowerShell",
+  "Azure OpenAI",
+  "Productivity",
+  "Cloud Computing",
+  "Security",
+  "Networking",
+  "Microsoft Teams",
+  "Docker",
+  "IoT",
+  "Raspberry Pi",
+  ".NET",
+  "Web Development",
+  "Remote Work",
+  "Professional Development",
+  "Software Development",
+  "Automation",
+  "AI",
+  "Power Automate",
+  "Azure Functions",
+  "Identity",
+  "DevOps",
+];
+
 function generateTagsWithOllama(post, model) {
   try {
     const prompt = [
-      "Return only 3 to 5 blog tags as a comma-separated list.",
+      "Choose 3 to 5 tags for this blog post from the allowed list below.",
+      "Return only the chosen tags as a comma-separated list.",
+      "Do not include any tags not in the allowed list.",
       "Do not include explanations, bullets, prefixes, or hashtags.",
+      `Allowed tags: ${TAG_CHOICES.join(", ")}.`,
       `Title: ${post.title || ""}`,
       `Content: ${(post.plaintext || "").substring(0, 1200)}`,
       "Tags:",
@@ -298,7 +389,7 @@ function generateTagsWithOllama(post, model) {
       .split(",")
       .map((tag) => tag.replace(/^tags:\s*/i, "").trim())
       .map((tag) => tag.replace(/^[-*]\s*/, ""))
-      .filter((tag) => tag.length > 0)
+      .filter((tag) => TAG_CHOICES.includes(tag))
       .slice(0, 5);
 
     return tags;
